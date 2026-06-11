@@ -1,0 +1,30 @@
+# ── Build artifacts de ROS 2 ────────────────────────────────────────────────
+build/
+install/
+log/
+.ros/
+
+# ── Ament / setuptools boilerplate (no aportan contexto de lógica) ──────────
+setup.cfg
+setup.py
+package.xml
+resource/
+
+# ── Tests genéricos autogenerados (copyright, flake8, pep257) ───────────────
+test/
+
+# ── Python compilado ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Modelos y datos pesados (si los agregas después) ────────────────────────
+*.pt
+*.onnx
+*.bag
+*.db3
+datasets/
+
+deliverable.md
+
+my_opencv_demo/sub_image.py
