@@ -16,7 +16,7 @@ from rcl_interfaces.msg import SetParametersResult
 from cv_bridge import CvBridge
 from std_msgs.msg import Int32, String
 from sensor_msgs.msg import Image, CompressedImage
-from my_opencv_demo.utils import fresh_qos, pub_img
+from puzzlebot_line_follower.utils import fresh_qos, pub_img
 
 try:
     from ultralytics import YOLO
@@ -64,7 +64,7 @@ class SignDetector(Node):
 
         self.declare_parameter(
             'yolo_model_path',
-            '/home/puzzlebot/ros2_ws/src/my_opencv_demo/my_opencv_demo/best100.pt'
+            '/home/puzzlebot/ros2_ws/src/puzzlebot_line_follower/puzzlebot_line_follower/best100.pt'
         )
 
         # Umbral para señales normales

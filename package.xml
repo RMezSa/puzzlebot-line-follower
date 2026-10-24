@@ -1,19 +1,22 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>my_opencv_demo</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="roberd@todo.todo">roberd</maintainer>
-  <license>TODO: License declaration</license>
+  <name>puzzlebot_line_follower</name>
+  <version>1.0.0</version>
+  <description>Autonomous line following for the Puzzlebot: classical vision line and zebra crossing detection, YOLOv8 sign and traffic light detection, and a Mamdani fuzzy controller with a state machine</description>
+  <maintainer email="meza.sainz.roberd.otoniel@gmail.com">Roberd Meza</maintainer>
+  <license>MIT</license>
+  <author>Roberd Meza</author>
+  <author>Emiliano Moreno Gómez</author>
 
   <depend>rclpy</depend>
+  <depend>rcl_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>cv_bridge</depend>
-  <depend>image_transport</depend>
-  <depend>OpenCV</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

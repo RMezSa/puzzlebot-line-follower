@@ -1,0 +1,29 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+.ros/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Model weights and recordings (too large for git)
+*.pt
+*.onnx
+*.engine
+*.bag
+*.db3
+*.mcap
+
+# Local tooling
+CLAUDE.md
+.claude/
+.claudeignore
+
+# Editor / OS
+.vscode/
+*.swp
+*~
+.DS_Store

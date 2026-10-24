@@ -1,10 +1,10 @@
 from setuptools import find_packages, setup
 
-package_name = 'my_opencv_demo'
+package_name = 'puzzlebot_line_follower'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='1.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -13,10 +13,10 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='roberd',
-    maintainer_email='roberd@todo.todo',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    maintainer='Roberd Meza',
+    maintainer_email='meza.sainz.roberd.otoniel@gmail.com',
+    description='Autonomous line following for the Puzzlebot with fuzzy control, YOLOv8 and classical vision',
+    license='MIT',
     extras_require={
         'test': [
             'pytest',
@@ -24,11 +24,12 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'sub_image = my_opencv_demo.sub_image:main',
-            'line_follower_memoria = my_opencv_demo.line_follower_memoria:main',
-            'line_follower_controller = my_opencv_demo.line_follower_controller:main',
-            'deteccion = my_opencv_demo.deteccion:main',
-            'zebra_detector = my_opencv_demo.zebra_detector:main',
+            'line_follower_memoria = puzzlebot_line_follower.line_follower_memoria:main',
+            'zebra_detector = puzzlebot_line_follower.zebra_detector:main',
+            'deteccion = puzzlebot_line_follower.deteccion:main',
+            'line_follower_controller = puzzlebot_line_follower.line_follower_controller:main',
+            'mamdani_v1 = puzzlebot_line_follower.mamdani_v1:main',
+            'sugeno_v1 = puzzlebot_line_follower.sugeno_v1:main',
         ],
     },
 )
