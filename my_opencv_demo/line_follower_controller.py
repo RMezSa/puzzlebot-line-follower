@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-"""
-LineFollowerController — ROS 2 Humble
-Control difuso (Mamdani) + State Machine de cruce de zebra.
+"""Nodo ROS 2 de control difuso y maquina de estados del robot.
 
-Estados:
-  FOLLOW_LINE   — seguimiento normal con fuzzy
-  SIGN_LATCHED  — señal latcheada, sigue línea normalmente
-  STOP_SIGN     — alto por señal stop durante 3 segundos
-  STOP_PRE      — pausa antes de maniobra
-  CROSSING      — maniobra open-loop según señal latcheada
-  STOP_POST     — pausa después de maniobra
-  RECOVERING    — re-adquisición de línea tras cruce
-
-Semáforo:
-  red    = 1 → stop
-  yellow = 2 → reduce velocidad
-  green  = 3 → go
-  none   = 0 → go
-
-Latches:
-  - Usa flechas detectadas por YOLO.
-  - Si no hay flecha detectada, default = flecha_derecho.
+Combina error de linea, semaforo, senales YOLO y zebra para seguir linea,
+detenerse y ejecutar maniobras open-loop cuando corresponde.
 """
 
 import math
@@ -38,12 +20,11 @@ import numpy as np
 import skfuzzy as fuzz
 from skfuzzy import control
 
-
 LABELS = {0: "Sin color", 1: "Rojo", 2: "Amarillo", 3: "Verde"}
 
 LATCHABLE_SIGNS = {"flecha_derecha", "flecha_izquierda", "flecha_derecho"}
-STOP_SIGNS = {"stop"}
-
+PAUSE_SIGNS     = {"stop", "give_way"}
+ROADWORK_SIGNS  = {"roadwork_ahead"}
 
 class State(Enum):
     FOLLOW_LINE  = "FOLLOW_LINE"
@@ -53,7 +34,6 @@ class State(Enum):
     CROSSING     = "CROSSING"
     STOP_POST    = "STOP_POST"
     RECOVERING   = "RECOVERING"
-
 
 def build_fuzzy_system():
     E = control.Antecedent(np.arange(-320, 321, 1), "E")
@@ -85,108 +65,6 @@ def build_fuzzy_system():
     sistema = control.ControlSystem([r1, r2, r3, r4, r5])
     return control.ControlSystemSimulation(sistema)
 
-
-def build_fuzzy_system_v2():
-    """
-    FIS Mamdani de 2 entradas.
-      E  — error de línea en px         [-320, 320]
-      DE — derivada del error en px/s   [-300, 300]
-
-    Mismas membresías de E, V, W que v1.
-    DE tiene 3 membresías: decreciendo / estable / creciendo.
-
-    15 reglas (5E × 3DE) para W y para V.
-
-    Mejora clave respecto a v1:
-      - En la zona poco_error (0-100 px), si el error crece → corrección mucho
-      - Si el error decrece (ya corrigiendo) → ease-off para evitar sobreimpulso
-    """
-    E  = control.Antecedent(np.arange(-320, 321, 1),    "E")
-    DE = control.Antecedent(np.arange(-300, 301, 1),    "DE")
-    V  = control.Consequent(np.arange(0.0,  1.51, 0.01), "Velocidad_lineal")
-    W  = control.Consequent(np.arange(-3.0, 3.01, 0.01), "Velocidad_angular")
-
-    # ── E membresías (idénticas a v1) ────────────────────────────────────────
-    E["mucho_error_negativo"] = fuzz.zmf(E.universe, -250, -70)
-    E["poco_error_negativo"]  = fuzz.trimf(E.universe, [-100, -80, -8])
-    E["sin_error"]            = fuzz.trimf(E.universe, [-15, 0, 15])
-    E["poco_error_positivo"]  = fuzz.trimf(E.universe, [8, 80, 100])
-    E["mucho_error_positivo"] = fuzz.smf(E.universe, 70, 250)
-
-    # ── DE membresías ────────────────────────────────────────────────────────
-    DE["decreciendo"] = fuzz.zmf(DE.universe, -300, -20)   # error bajando (corrigiendo)
-    DE["estable"]     = fuzz.trimf(DE.universe, [-40, 0, 40])
-    DE["creciendo"]   = fuzz.smf(DE.universe,  20,  300)   # error subiendo (divergiendo)
-
-    # ── V membresías (idénticas a v1) ────────────────────────────────────────
-    V["nada"]   = fuzz.trimf(V.universe, [0.0, 0.0, 0.4])
-    V["poca"]   = fuzz.trimf(V.universe, [0.4, 0.65, 0.9])
-    V["normal"] = fuzz.trapmf(V.universe, [0.9, 1.5, 1.5, 1.5])
-
-    # ── W membresías (idénticas a v1) ────────────────────────────────────────
-    W["mucho_negativo"] = fuzz.trimf(W.universe, [-3.0, -3.0, -1.5])
-    W["poco_negativo"]  = fuzz.trimf(W.universe, [-1.5, -0.8, -0.3])
-    W["nada"]           = fuzz.trimf(W.universe, [-0.3,  0.0,  0.3])
-    W["poco_positivo"]  = fuzz.trimf(W.universe, [ 0.3,  0.8,  1.5])
-    W["mucho_positivo"] = fuzz.trimf(W.universe, [ 1.5,  3.0,  3.0])
-
-    # ── Reglas (15): tabla E × DE ─────────────────────────────────────────────
-    #
-    # W table:                decreciendo  estable       creciendo
-    #   mucho_neg             poco_pos     mucho_pos     mucho_pos
-    #   poco_neg              nada         poco_pos      mucho_pos   ← KEY: poco+creciendo → mucho
-    #   sin_error             poco_pos     nada          poco_neg    ← anticipa sobreimpulso
-    #   poco_pos              nada         poco_neg      mucho_neg   ← KEY: poco+creciendo → mucho
-    #   mucho_pos             poco_neg     mucho_neg     mucho_neg
-    #
-    # V table:                decreciendo  estable       creciendo
-    #   mucho_neg             poca         poca          nada
-    #   poco_neg              normal       normal        poca
-    #   sin_error             normal       normal        normal
-    #   poco_pos              normal       normal        poca
-    #   mucho_pos             poca         poca          nada
-
-    rules = [
-        # ── mucho_neg ─────────────────────────────────────────────────────
-        control.Rule(E["mucho_error_negativo"] & DE["decreciendo"],
-                     (V["poca"],   W["poco_positivo"])),
-        control.Rule(E["mucho_error_negativo"] & DE["estable"],
-                     (V["poca"],   W["mucho_positivo"])),
-        control.Rule(E["mucho_error_negativo"] & DE["creciendo"],
-                     (V["nada"],   W["mucho_positivo"])),
-        # ── poco_neg ──────────────────────────────────────────────────────
-        control.Rule(E["poco_error_negativo"]  & DE["decreciendo"],
-                     (V["normal"], W["nada"])),
-        control.Rule(E["poco_error_negativo"]  & DE["estable"],
-                     (V["normal"], W["poco_positivo"])),
-        control.Rule(E["poco_error_negativo"]  & DE["creciendo"],
-                     (V["poca"],   W["mucho_positivo"])),
-        # ── sin_error ─────────────────────────────────────────────────────
-        control.Rule(E["sin_error"]            & DE["decreciendo"],
-                     (V["normal"], W["poco_positivo"])),
-        control.Rule(E["sin_error"]            & DE["estable"],
-                     (V["normal"], W["nada"])),
-        control.Rule(E["sin_error"]            & DE["creciendo"],
-                     (V["normal"], W["poco_negativo"])),
-        # ── poco_pos ──────────────────────────────────────────────────────
-        control.Rule(E["poco_error_positivo"]  & DE["decreciendo"],
-                     (V["normal"], W["nada"])),
-        control.Rule(E["poco_error_positivo"]  & DE["estable"],
-                     (V["normal"], W["poco_negativo"])),
-        control.Rule(E["poco_error_positivo"]  & DE["creciendo"],
-                     (V["poca"],   W["mucho_negativo"])),
-        # ── mucho_pos ─────────────────────────────────────────────────────
-        control.Rule(E["mucho_error_positivo"] & DE["decreciendo"],
-                     (V["poca"],   W["poco_negativo"])),
-        control.Rule(E["mucho_error_positivo"] & DE["estable"],
-                     (V["poca"],   W["mucho_negativo"])),
-        control.Rule(E["mucho_error_positivo"] & DE["creciendo"],
-                     (V["nada"],   W["mucho_negativo"])),
-    ]
-
-    return control.ControlSystemSimulation(control.ControlSystem(rules))
-
-
 class LineFollowerController(Node):
     def __init__(self):
         super().__init__("line_follower_controller")
@@ -201,135 +79,101 @@ class LineFollowerController(Node):
         self.create_subscription(Bool,    "/zebra_detected",  self.cb_zebra,         10)
         self.create_subscription(String,  "/sign_detections", self.cb_signs,         10)
 
-        self.fuzzy_sim = build_fuzzy_system_v2()
+        self.fuzzy_sim = build_fuzzy_system()
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 1 — ANTI-OSCILACIÓN  (los más importantes del tuning)   ║
-        # ║  Estos tres atacan directamente el zigzag del robot.            ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("error_filter_alpha", 0.45)  # suaviza el error de línea (0=muy suave, 1=crudo)
-        self.declare_parameter("angular_slew_rate",  1.40)  # máximo cambio de giro por segundo (evita latigazos)
-        self.declare_parameter("max_angular_z",      0.55)  # límite absoluto de giro rad/s
+        self.declare_parameter("error_filter_alpha", 0.45)
+        self.declare_parameter("angular_slew_rate",  1.40)
+        self.declare_parameter("max_angular_z",      0.55)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 2 — VELOCIDAD EN CURVAS                                  ║
-        # ║  Evitan que intente corregir a alta velocidad en curvas.         ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("curve_slowdown_error", 90.0)  # error (px) a partir del cual empieza a bajar v
-        self.declare_parameter("curve_min_v_factor",   0.55)  # en curva máxima, baja hasta el 55% de la v normal
+        self.declare_parameter("curve_slowdown_error", 90.0)
+        self.declare_parameter("curve_min_v_factor",   0.55)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 3 — ESCALA FUZZY                                         ║
-        # ║  Controlan la agresividad general del controlador.               ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("fuzzy_v_scale", 0.10)  # multiplica la velocidad lineal que da el fuzzy
-        self.declare_parameter("fuzzy_w_scale", 0.20)  # multiplica la velocidad angular que da el fuzzy
-        self.declare_parameter("error_gain",    0.75)  # reduce cuánto "siente" el error (evita paranoia)
+        self.declare_parameter("fuzzy_v_scale", 0.10)
+        self.declare_parameter("fuzzy_w_scale", 0.20)
+        self.declare_parameter("error_gain",    0.75)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 4 — RAMPA DE VELOCIDAD LINEAL                            ║
-        # ║  Controlan la aceleración/frenada del robot.                     ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("accel_rate_up",          0.05)  # qué tan rápido acelera (bajo = suave)
-        self.declare_parameter("accel_rate_down",        0.30)  # qué tan rápido frena (alto = frena rápido)
-        self.declare_parameter("soft_start_v_threshold", 0.08)  # velocidad hasta la que aplica soft-start
-        self.declare_parameter("soft_start_min_factor",  0.25)  # factor mínimo de aceleración en soft-start
+        self.declare_parameter("accel_rate_up",          0.05)
+        self.declare_parameter("accel_rate_down",        0.30)
+        self.declare_parameter("soft_start_v_threshold", 0.08)
+        self.declare_parameter("soft_start_min_factor",  0.25)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 5 — COMPORTAMIENTO SI SE PIERDE LA LÍNEA                 ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("line_lost_timeout", 0.5)   # segundos sin señal para declarar línea perdida
-        self.declare_parameter("line_lost_speed",   0.10)  # velocidad de búsqueda cuando pierde la línea
+        self.declare_parameter("line_lost_timeout", 0.5)
+        self.declare_parameter("line_lost_speed",   0.10)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 6 — SEMÁFORO                                             ║
-        # ╚══════════════════════════════════════════════════════════════════╝
         self.declare_parameter("traffic_light_enabled",  True)
-        self.declare_parameter("yellow_slowdown_factor", 0.50)  # amarillo = 50% de velocidad
-        self.declare_parameter("tl_buffer_size",         10)    # ventana de frames para filtrar color
-        self.declare_parameter("tl_red_ratio",           0.50)  # fracción del buffer para confirmar rojo
+        self.declare_parameter("yellow_slowdown_factor", 0.50)
+        self.declare_parameter("tl_buffer_size",         10)
+        self.declare_parameter("tl_red_ratio",           0.50)
         self.declare_parameter("tl_yellow_ratio",        0.50)
         self.declare_parameter("tl_green_ratio",         0.50)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 7 — SEÑAL STOP                                           ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("stop_sign_enabled",  True)
-        self.declare_parameter("stop_sign_duration", 3.0)  # segundos de alto al ver stop
+        self.declare_parameter("stop_sign_enabled",     True)
+        self.declare_parameter("stop_sign_delay",       5.0)
+        self.declare_parameter("stop_sign_duration",    15.0)
+        self.declare_parameter("stop_sign_cooldown",    7.0)
+        self.declare_parameter("give_way_sign_enabled", True)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 8 — MANIOBRAS OPEN-LOOP EN CRUCE                        ║
-        # ║  Cada maniobra: fwd1 (avanza) → turn (gira) → fwd2 (avanza)    ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        # Flecha derecha → gira derecha
+        self.declare_parameter("roadwork_sign_enabled", True)
+        self.declare_parameter("roadwork_duration",     3.0)
+        self.declare_parameter("roadwork_cooldown",     7.0)
+        self.declare_parameter("roadwork_speed_factor", 0.5)
+
         self.declare_parameter("cross_right_fwd1_v",  0.12)
         self.declare_parameter("cross_right_fwd1_t",  3.5)
-        self.declare_parameter("cross_right_turn_w", -0.6)  # negativo = gira derecha
+        self.declare_parameter("cross_right_turn_w", -0.6)
         self.declare_parameter("cross_right_turn_t",  2.6)
         self.declare_parameter("cross_right_fwd2_v",  0.12)
         self.declare_parameter("cross_right_fwd2_t",  2.0)
 
-        # Flecha izquierda → gira izquierda
         self.declare_parameter("cross_left_fwd1_v",  0.12)
         self.declare_parameter("cross_left_fwd1_t",  3.5)
-        self.declare_parameter("cross_left_turn_w",   0.6)  # positivo = gira izquierda
+        self.declare_parameter("cross_left_turn_w",   0.6)
         self.declare_parameter("cross_left_turn_t",   2.6)
         self.declare_parameter("cross_left_fwd2_v",  0.12)
         self.declare_parameter("cross_left_fwd2_t",  2.0)
 
-        # Flecha derecho → sigue recto
         self.declare_parameter("cross_straight_v", 0.12)
         self.declare_parameter("cross_straight_t", 5.0)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 9 — RE-ADQUISICIÓN DE LÍNEA TRAS CRUCE                  ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        self.declare_parameter("recover_stable_frames", 5)   # frames consecutivos con línea para salir de RECOVERING
-        self.declare_parameter("recover_timeout",       5.0) # timeout máximo si nunca re-adquiere
+        self.declare_parameter("recover_stable_frames", 5)
+        self.declare_parameter("recover_timeout",       5.0)
 
-        # ╔══════════════════════════════════════════════════════════════════╗
-        # ║  GRUPO 10 — LATCH DE SEÑAL                                      ║
-        # ║  Qué flecha ejecutar al cruzar la zebra.                        ║
-        # ╚══════════════════════════════════════════════════════════════════╝
-        # perma_latch: "none" = usa YOLO | "flecha_derecha/izquierda/derecho" = forzar (debug)
+        # perma_latch: "none" usa YOLO; otro valor fuerza una señal para debug.
         self.declare_parameter("perma_latch",   "none")
-        self.declare_parameter("default_latch", "flecha_derecho")  # si YOLO no vio flecha, va recto
+        self.declare_parameter("default_latch", "none")
 
-        # ── Pausa antes/después de maniobra (debug) ──────────────────────
         self.declare_parameter("debug_stop_duration", 0.1)
 
         self._cache_params()
         self.add_on_set_parameters_callback(self._on_params_changed)
 
-        # ── Estado fuzzy/línea ───────────────────────────────────────────────
         self.current_v      = 0.0
         self.current_w      = 0.0
         self.line_error     = None
-        self.prev_error          = 0.0
-        self.filtered_error      = 0.0
-        self.prev_filtered_error = 0.0
+        self.prev_error     = 0.0
+        self.filtered_error = 0.0
         self.last_error_t   = self.get_clock().now()
         self.prev_control_t = self.get_clock().now()
 
-        # Último comando publicado
         self.last_v = 0.0
         self.last_w = 0.0
 
-        # ── Estado semáforo ──────────────────────────────────────────────────
         self.detected_color   = 0
         self.raw_buffer       = deque(maxlen=int(self.p_tl_buffer_size))
-        self._tl_latched_stop = False   # True = stopped by red, waiting for green/yellow
+        self._tl_latched_stop = False
 
-        # ── Estado de señal STOP ─────────────────────────────────────────────
-        self.stop_sign_active   = False
-        self.stop_sign_consumed = False
-        self._stop_sign_t0      = None
+        self.stop_sign_active      = False
+        self.stop_sign_consumed    = False
+        self._stop_sign_seen_t     = None
+        self._stop_sign_t0         = None
+        self._stop_sign_cooldown_t = None
 
-        # ── State machine ────────────────────────────────────────────────────
-        self.state        = State.SIGN_LATCHED
-        self.latched_sign = self.p_default_latch
-        self.zebra_active = False
+        self._roadwork_trigger_t = None
 
+        self.state        = State.FOLLOW_LINE
+        self.latched_sign = "none"          # ← CAMBIO: era self.p_default_latch
+
+        self.zebra_active   = False
         self.zebra_consumed = False
 
         self._maneuver_steps = []
@@ -341,11 +185,10 @@ class LineFollowerController(Node):
         self._recover_stable = 0
         self._recover_t0     = None
 
+        self._tl_just_released = False
+
         self.create_timer(0.1, self.control_loop)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Caché de parámetros
-    # ─────────────────────────────────────────────────────────────────────────
     def _cache_params(self):
         self.p_accel_rate_up     = float(self.get_parameter("accel_rate_up").value)
         self.p_accel_rate_down   = float(self.get_parameter("accel_rate_down").value)
@@ -373,8 +216,15 @@ class LineFollowerController(Node):
         self.p_tl_yellow_ratio        = float(self.get_parameter("tl_yellow_ratio").value)
         self.p_tl_green_ratio         = float(self.get_parameter("tl_green_ratio").value)
 
-        self.p_stop_sign_enabled  = bool(self.get_parameter("stop_sign_enabled").value)
-        self.p_stop_sign_duration = float(self.get_parameter("stop_sign_duration").value)
+        self.p_stop_sign_enabled     = bool(self.get_parameter("stop_sign_enabled").value)
+        self.p_stop_sign_delay       = float(self.get_parameter("stop_sign_delay").value)
+        self.p_stop_sign_duration    = float(self.get_parameter("stop_sign_duration").value)
+        self.p_stop_sign_cooldown    = float(self.get_parameter("stop_sign_cooldown").value)
+        self.p_give_way_sign_enabled = bool(self.get_parameter("give_way_sign_enabled").value)
+        self.p_roadwork_sign_enabled = bool(self.get_parameter("roadwork_sign_enabled").value)
+        self.p_roadwork_duration     = float(self.get_parameter("roadwork_duration").value)
+        self.p_roadwork_cooldown     = float(self.get_parameter("roadwork_cooldown").value)
+        self.p_roadwork_speed_factor = float(self.get_parameter("roadwork_speed_factor").value)
 
         self.p_cross_right = [
             (
@@ -427,7 +277,9 @@ class LineFollowerController(Node):
         self.p_perma_latch = raw_pl if raw_pl in LATCHABLE_SIGNS else None
 
         raw_default = str(self.get_parameter("default_latch").value).strip().lower()
-        self.p_default_latch = raw_default if raw_default in LATCHABLE_SIGNS else "flecha_derecho"
+        self.p_default_latch = (
+            raw_default if raw_default in LATCHABLE_SIGNS else "none"
+        )
 
         self.p_debug_stop_duration = float(self.get_parameter("debug_stop_duration").value)
 
@@ -452,17 +304,7 @@ class LineFollowerController(Node):
 
         return SetParametersResult(successful=True)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Callbacks
-    # ─────────────────────────────────────────────────────────────────────────
     def cb_traffic_light(self, msg):
-        """
-        /semaforo:
-          0 = ninguno
-          1 = rojo
-          2 = amarillo
-          3 = verde
-        """
         val = int(msg.data)
         if val not in (0, 1, 2, 3):
             val = 0
@@ -470,13 +312,12 @@ class LineFollowerController(Node):
         self.raw_buffer.append(val)
 
         counts = Counter(self.raw_buffer)
-
         n = max(1, len(self.raw_buffer))
+
         red_ratio    = counts[1] / n
         yellow_ratio = counts[2] / n
         green_ratio  = counts[3] / n
 
-        # Prioridad: rojo > amarillo > verde > none
         if red_ratio >= self.p_tl_red_ratio:
             new_color = 1
         elif yellow_ratio >= self.p_tl_yellow_ratio:
@@ -499,45 +340,83 @@ class LineFollowerController(Node):
 
     def cb_line_error(self, msg):
         val = float(msg.data)
-
         if not math.isnan(val):
             self.line_error   = val
             self.last_error_t = self.get_clock().now()
 
     def cb_zebra(self, msg):
         new_val = bool(msg.data)
-
         if not new_val:
             self.zebra_consumed = False
-
         self.zebra_active = new_val
 
     def cb_signs(self, msg):
         """
         Procesa:
-          - stop: activa rutina de alto 3 s
-          - flechas: latch normal si perma_latch está apagado
+          - stop / give_way: activa rutina de pausa + cooldown anti-loop 7 s
+          - roadwork_ahead: reduce velocidad al 50 % por 3 s + cooldown 7 s
+          - flechas: latch normal; flecha_derecho no puede override un giro ya latcheado
 
-        Aunque perma_latch esté activo, sí procesamos STOP.
+        Aunque perma_latch esté activo, sí procesamos señales de pausa/roadwork.
         """
         try:
             detections = json.loads(msg.data)
         except Exception:
             return
 
-        # ── STOP sign ────────────────────────────────────────────────────────
         stop_candidates = [
             d for d in detections
-            if str(d.get("class_name", "")).lower() in STOP_SIGNS
+            if str(d.get("class_name", "")).lower() == "stop"
+            and self.p_stop_sign_enabled
+        ]
+        give_way_candidates = [
+            d for d in detections
+            if str(d.get("class_name", "")).lower() == "give_way"
+            and self.p_give_way_sign_enabled
         ]
 
-        if stop_candidates:
+        if stop_candidates or give_way_candidates:
             self.stop_sign_active = True
+            now_t = self.get_clock().now()
+            cooldown_ok = (
+                self._stop_sign_cooldown_t is None
+                or self._elapsed(self._stop_sign_cooldown_t, now_t) >= self.p_stop_sign_cooldown
+            )
+            if (
+                self._stop_sign_seen_t is None
+                and not self.stop_sign_consumed
+                and cooldown_ok
+                and self.state in (State.FOLLOW_LINE, State.SIGN_LATCHED)
+            ):
+                self._stop_sign_seen_t = now_t
+                self.get_logger().info(
+                    f"[SM] STOP/GIVE_WAY visto -> alto en {self.p_stop_sign_delay:.1f}s"
+                )
         else:
             self.stop_sign_active = False
             self.stop_sign_consumed = False
 
-        # ── Si perma_latch está activo, no usamos flechas de YOLO ─────────────
+        if self.p_roadwork_sign_enabled:
+            roadwork_candidates = [
+                d for d in detections
+                if str(d.get("class_name", "")).lower() in ROADWORK_SIGNS
+            ]
+            if roadwork_candidates:
+                now_t = self.get_clock().now()
+                cooldown_ok = (
+                    self._roadwork_trigger_t is None
+                    or self._elapsed(self._roadwork_trigger_t, now_t)
+                       >= (self.p_roadwork_duration + self.p_roadwork_cooldown)
+                )
+                if cooldown_ok:
+                    self._roadwork_trigger_t = now_t
+                    self.get_logger().info(
+                        f"[SM] Roadwork ahead → velocidad al "
+                        f"{self.p_roadwork_speed_factor*100:.0f}% "
+                        f"por {self.p_roadwork_duration:.1f}s"
+                    )
+
+        # ── Si perma_latch está activo, no usamos flechas de YOLO ────────────
         if self.p_perma_latch is not None:
             return
 
@@ -552,8 +431,7 @@ class LineFollowerController(Node):
         if not candidates:
             return
 
-        # flecha_derecho (straight) is frequently confused with the turn arrows.
-        # When a turn arrow is also detected, the turn is almost certainly correct.
+        # Preferir flechas de giro sobre flecha_derecho cuando ambas presentes
         turn_candidates = [
             d for d in candidates
             if d["class_name"] in {"flecha_derecha", "flecha_izquierda"}
@@ -564,29 +442,30 @@ class LineFollowerController(Node):
         best = max(candidates, key=lambda d: d.get("bbox_area", 0))
         new_sign = best["class_name"]
 
+        # flecha_derecho no puede overridear un giro ya confirmado
+        if (
+            new_sign == "flecha_derecho"
+            and self.latched_sign in {"flecha_derecha", "flecha_izquierda"}
+        ):
+            return
+
         if new_sign != self.latched_sign:
             self.latched_sign = new_sign
             self.state        = State.SIGN_LATCHED
 
             self.get_logger().info(f"[SM] Señal latcheada desde YOLO: {self.latched_sign}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Helpers
-    # ─────────────────────────────────────────────────────────────────────────
-    def _compute_fuzzy_control(self, error_px: float, delta_e: float = 0.0):
+    def _compute_fuzzy_control(self, error_px: float):
         error_scaled  = error_px * self.p_error_gain
         error_clamped = min(max(error_scaled, -320.0), 320.0)
-        de_clamped    = min(max(delta_e, -300.0), 300.0)
 
-        self.fuzzy_sim.input["E"]  = error_clamped
-        self.fuzzy_sim.input["DE"] = de_clamped
+        self.fuzzy_sim.input["E"] = error_clamped
         self.fuzzy_sim.compute()
 
         target_v = (
             float(self.fuzzy_sim.output["Velocidad_lineal"])
             * self.p_fuzzy_v_scale
         )
-
         angular_z = (
             float(self.fuzzy_sim.output["Velocidad_angular"])
             * self.p_fuzzy_w_scale
@@ -596,19 +475,16 @@ class LineFollowerController(Node):
 
     def _filter_line_error(self, raw_error: float):
         alpha = min(max(self.p_error_filter_alpha, 0.0), 1.0)
-
         self.filtered_error = (
             alpha * raw_error
             + (1.0 - alpha) * self.filtered_error
         )
-
         return self.filtered_error
 
     def _limit_angular_rate(self, target_w: float, dt_sec: float):
         target_w = min(max(target_w, -self.p_max_angular_z), self.p_max_angular_z)
-
         max_step = self.p_angular_slew_rate * dt_sec
-        delta = target_w - self.current_w
+        delta    = target_w - self.current_w
 
         if abs(delta) <= max_step:
             self.current_w = target_w
@@ -618,9 +494,8 @@ class LineFollowerController(Node):
         return self.current_w
 
     def _curve_speed_factor(self, error_px: float):
-        denom = max(self.p_curve_slowdown_error, 1.0)
-        ratio = min(abs(error_px) / denom, 1.0)
-
+        denom  = max(self.p_curve_slowdown_error, 1.0)
+        ratio  = min(abs(error_px) / denom, 1.0)
         factor = 1.0 - (1.0 - self.p_curve_min_v_factor) * ratio
         return min(max(factor, self.p_curve_min_v_factor), 1.0)
 
@@ -631,7 +506,6 @@ class LineFollowerController(Node):
         cmd = Twist()
         cmd.linear.x  = self.last_v
         cmd.angular.z = self.last_w
-
         self.pub_cmd.publish(cmd)
 
     def _hard_stop(self):
@@ -654,9 +528,7 @@ class LineFollowerController(Node):
     def _set_crossing(self, active: bool):
         if active == self._crossing_active:
             return
-
         self._crossing_active = active
-
         msg = Bool()
         msg.data = active
         self.pub_crossing.publish(msg)
@@ -666,9 +538,9 @@ class LineFollowerController(Node):
             return False
 
         if self._tl_latched_stop:
-            # Only release on explicit green or yellow; none/lost keeps us stopped.
             if self.detected_color in (2, 3):
-                self._tl_latched_stop = False
+                self._tl_latched_stop  = False
+                self._tl_just_released = True
                 self.get_logger().info(
                     f"[Semáforo] Latch liberado por {LABELS.get(self.detected_color, '?')}"
                 )
@@ -684,43 +556,45 @@ class LineFollowerController(Node):
     def _traffic_speed_factor(self):
         if not self.p_traffic_light_enabled:
             return 1.0
-
-        # Amarillo: baja velocidad sin detener.
         if self.detected_color == 2:
             return min(max(self.p_yellow_slowdown_factor, 0.0), 1.0)
-
         return 1.0
 
     def _ensure_latch(self):
         """
-        Mantiene siempre un latch válido.
-
-        - Si perma_latch está activo, fuerza ese valor.
-        - Si no hay perma_latch y no se ha visto flecha, usa default_latch.
+        CAMBIO vs versión anterior:
+          - Si perma_latch está activo, fuerza ese valor (comportamiento idéntico).
+          - Si NO hay perma_latch, ya NO se fuerza ningún default.
+            El robot simplemente permanece en FOLLOW_LINE sin latch.
+          - Solo transiciona a SIGN_LATCHED si perma_latch está activo.
         """
         if self.p_perma_latch is not None:
             self.latched_sign = self.p_perma_latch
-        elif self.latched_sign not in LATCHABLE_SIGNS:
-            self.latched_sign = self.p_default_latch
+            if self.state == State.FOLLOW_LINE:
+                self.state = State.SIGN_LATCHED
 
-        if self.state == State.FOLLOW_LINE and self.latched_sign in LATCHABLE_SIGNS:
-            self.state = State.SIGN_LATCHED
+        # Sin perma_latch: no hacer nada. El latch solo llega desde cb_signs (YOLO).
 
     def _reset_to_default_latch(self):
         """
-        Después de una maniobra, vuelve a default_latch.
-        Si YOLO ve otra flecha después, cb_signs la sobrescribe.
+        Después de una maniobra, vuelve al estado base.
+
+        CAMBIO vs versión anterior:
+          - Si perma_latch activo: igual que antes (mantiene el latch forzado).
+          - Si no: latched_sign = "none" y estado = FOLLOW_LINE.
+            El robot sigue la línea normalmente hasta que YOLO detecte otra flecha.
         """
         if self.p_perma_latch is not None:
             self.latched_sign = self.p_perma_latch
+            self.state        = State.SIGN_LATCHED
         else:
-            self.latched_sign = self.p_default_latch
-
-        self.state = State.SIGN_LATCHED
+            self.latched_sign = "none"
+            self.state        = State.FOLLOW_LINE
 
     def _start_stop_sign_routine(self):
         self.state = State.STOP_SIGN
         self._stop_sign_t0 = self.get_clock().now()
+        self._stop_sign_seen_t = None
         self.stop_sign_consumed = True
         self._set_crossing(False)
         self._hard_stop()
@@ -751,9 +625,6 @@ class LineFollowerController(Node):
             f"({self.p_debug_stop_duration:.2f} s pause before maneuver)"
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Control loop
-    # ─────────────────────────────────────────────────────────────────────────
     def control_loop(self):
         now    = self.get_clock().now()
         dt_sec = self._elapsed(self.prev_control_t, now)
@@ -762,35 +633,32 @@ class LineFollowerController(Node):
         if dt_sec <= 0.0:
             dt_sec = 0.1
 
-        # Mantener latch válido: YOLO si existe, default recto si no.
+        # _ensure_latch solo actúa si perma_latch está activo
         if self.state in (State.FOLLOW_LINE, State.SIGN_LATCHED):
             self._ensure_latch()
 
-        # ── STOP_SIGN ────────────────────────────────────────────────────────
         if self.state == State.STOP_SIGN:
             self._hard_stop()
-
             if self._elapsed(self._stop_sign_t0, now) >= self.p_stop_sign_duration:
+                self._stop_sign_cooldown_t = now
+                self._stop_sign_seen_t = None
                 self._reset_to_default_latch()
-                self.get_logger().info("[SM] STOP_SIGN terminado → SIGN_LATCHED/default")
-
+                self.get_logger().info(
+                    f"[SM] STOP_SIGN terminado → {self.state.value} "
+                    f"(cooldown {self.p_stop_sign_cooldown:.1f}s)"
+                )
             return
 
-        # ── STOP_PRE ─────────────────────────────────────────────────────────
         if self.state == State.STOP_PRE:
             self._hard_stop()
-
             if self._elapsed(self._stop_t0, now) >= self.p_debug_stop_duration:
                 self._maneuver_t0 = now
                 self.state        = State.CROSSING
-
                 self.get_logger().info(
                     f"[SM] → CROSSING ({len(self._maneuver_steps)} pasos)"
                 )
-
             return
 
-        # ── CROSSING ─────────────────────────────────────────────────────────
         if self.state == State.CROSSING:
             if self._maneuver_idx >= len(self._maneuver_steps):
                 self._enter_stop_post(now)
@@ -816,40 +684,31 @@ class LineFollowerController(Node):
             self._publish(v, w)
             return
 
-        # ── STOP_POST ────────────────────────────────────────────────────────
         if self.state == State.STOP_POST:
             self._hard_stop()
-
             if self._elapsed(self._stop_t0, now) >= self.p_debug_stop_duration:
-                self._set_crossing(False)   # re-enable line follower so it can publish error data
+                self._set_crossing(False)
                 self.state           = State.RECOVERING
                 self._recover_stable = 0
                 self._recover_t0     = now
-
                 self.get_logger().info("[SM] → RECOVERING")
-
             return
 
-        # ── RECOVERING ───────────────────────────────────────────────────────
         if self.state == State.RECOVERING:
-            age = self._elapsed(self.last_error_t, now)
-
+            age     = self._elapsed(self.last_error_t, now)
             line_ok = (
                 age < self.p_line_lost_timeout
                 and self.line_error is not None
             )
 
             self._recover_stable = (
-                self._recover_stable + 1
-                if line_ok
-                else 0
+                self._recover_stable + 1 if line_ok else 0
             )
 
             if self._elapsed(self._recover_t0, now) > self.p_recover_timeout:
                 self.get_logger().warn(
                     "[SM] RECOVERING timeout → default latch forzado"
                 )
-
                 self._set_crossing(False)
                 self.zebra_active = False
                 self._reset_to_default_latch()
@@ -858,9 +717,8 @@ class LineFollowerController(Node):
             if self._recover_stable >= self.p_recover_stable_frames:
                 self.get_logger().info(
                     f"[SM] Línea re-adquirida "
-                    f"({self._recover_stable} frames) → default latch"
+                    f"({self._recover_stable} frames) → {self.state.value}"
                 )
-
                 self._set_crossing(False)
                 self.zebra_active = False
                 self._reset_to_default_latch()
@@ -869,19 +727,20 @@ class LineFollowerController(Node):
             self._hard_stop()
             return
 
-        # ── FOLLOW_LINE / SIGN_LATCHED ───────────────────────────────────────
-
-        # STOP sign tiene prioridad sobre semáforo y seguimiento normal.
+        # STOP / GIVE_WAY tienen prioridad, pero se ejecutan con delay.
         if (
-            self.p_stop_sign_enabled
-            and self.state in (State.FOLLOW_LINE, State.SIGN_LATCHED)
-            and self.stop_sign_active
+            self.state in (State.FOLLOW_LINE, State.SIGN_LATCHED)
+            and self._stop_sign_seen_t is not None
             and not self.stop_sign_consumed
+            and (
+                self._stop_sign_cooldown_t is None
+                or self._elapsed(self._stop_sign_cooldown_t, now) >= self.p_stop_sign_cooldown
+            )
+            and self._elapsed(self._stop_sign_seen_t, now) >= self.p_stop_sign_delay
         ):
             self._start_stop_sign_routine()
             return
 
-        # Semáforo: solo rojo detiene. Amarillo reduce velocidad más abajo.
         if self.state in (State.FOLLOW_LINE, State.SIGN_LATCHED) and self._traffic_should_stop():
             self._hard_stop()
             self.get_logger().info(
@@ -890,9 +749,12 @@ class LineFollowerController(Node):
             )
             return
 
-        # Zebra + señal latcheada → maniobra.
+        # CAMBIO: guarda extra `self.latched_sign in LATCHABLE_SIGNS`.
+        # Si no hay latch real (latched_sign == "none"), la zebra se ignora
+        # y el robot sigue la línea con normalidad.
         if (
             self.state == State.SIGN_LATCHED
+            and self.latched_sign in LATCHABLE_SIGNS    # ← nueva guarda
             and self.zebra_active
             and not self.zebra_consumed
         ):
@@ -906,13 +768,11 @@ class LineFollowerController(Node):
         # En SIGN_LATCHED con línea perdida: congelar último comando.
         if self.state == State.SIGN_LATCHED and line_lost:
             self._publish(self.last_v, self.last_w)
-
             self.get_logger().info(
                 f"[SIGN_LATCHED] Línea perdida → congelando "
                 f"v={self.last_v:.3f} w={self.last_w:.3f}",
                 throttle_duration_sec=0.5,
             )
-
             return
 
         active_error_raw = (
@@ -922,33 +782,39 @@ class LineFollowerController(Node):
         )
 
         self.prev_error = active_error_raw
+        active_error    = self._filter_line_error(active_error_raw)
 
-        active_error = self._filter_line_error(active_error_raw)
-
-        delta_e = (active_error - self.prev_filtered_error) / dt_sec if dt_sec > 0.0 else 0.0
-        self.prev_filtered_error = active_error
-
-        target_v, angular_z, error_clamped = self._compute_fuzzy_control(active_error, delta_e)
+        target_v, angular_z, error_clamped = self._compute_fuzzy_control(active_error)
 
         if line_lost:
             target_v *= self.p_line_lost_speed
         else:
             target_v *= self._curve_speed_factor(active_error)
 
-        # Semáforo amarillo: reducir velocidad sin detener.
         target_v *= self._traffic_speed_factor()
+
+        # Roadwork ahead: velocidad reducida.
+        if (
+            self._roadwork_trigger_t is not None
+            and self._elapsed(self._roadwork_trigger_t, now) < self.p_roadwork_duration
+        ):
+            target_v *= self.p_roadwork_speed_factor
 
         # Rampa asimétrica de velocidad lineal.
         error_v = target_v - self.current_v
 
         if error_v >= 0.0:
-            if self.p_ss_v_threshold > 1e-6:
-                ratio = min(self.current_v / self.p_ss_v_threshold, 1.0)
+            if self._tl_just_released:
+                ss_factor = 1.0
+                if self.current_v >= self.p_ss_v_threshold:
+                    self._tl_just_released = False
+            elif self.p_ss_v_threshold > 1e-6:
+                ratio     = min(self.current_v / self.p_ss_v_threshold, 1.0)
+                ss_factor = self.p_ss_min_factor + (1.0 - self.p_ss_min_factor) * ratio
             else:
-                ratio = 1.0
+                ss_factor = 1.0
 
-            ss_factor = self.p_ss_min_factor + (1.0 - self.p_ss_min_factor) * ratio
-            max_step  = self.p_accel_rate_up * ss_factor * dt_sec
+            max_step = self.p_accel_rate_up * ss_factor * dt_sec
         else:
             max_step = self.p_accel_rate_down * dt_sec
 
@@ -957,15 +823,22 @@ class LineFollowerController(Node):
         else:
             self.current_v += max_step if error_v > 0 else -max_step
 
-        # Suavizado/límite del giro final.
         if self.current_v <= 1e-3:
             self.current_w = 0.0
-            angular_z = 0.0
+            angular_z      = 0.0
         else:
             angular_z = self._limit_angular_rate(angular_z, dt_sec)
 
         self._publish(self.current_v, angular_z)
 
+        rw_elapsed = (
+            self._elapsed(self._roadwork_trigger_t, now)
+            if self._roadwork_trigger_t is not None else -1.0
+        )
+        stop_cd = (
+            self._elapsed(self._stop_sign_cooldown_t, now)
+            if self._stop_sign_cooldown_t is not None else -1.0
+        )
         self.get_logger().info(
             f"[{self.state.value}]  "
             f"v={self.current_v:.3f}  "
@@ -979,10 +852,11 @@ class LineFollowerController(Node):
             f"zebra={self.zebra_active}  "
             f"zebra_consumed={self.zebra_consumed}  "
             f"stop={self.stop_sign_active}/{self.stop_sign_consumed}  "
+            f"stop_cd={stop_cd:.1f}s  "
+            f"rw={rw_elapsed:.1f}s  "
             f"tl={LABELS.get(self.detected_color, '?')}",
             throttle_duration_sec=0.5,
         )
-
 
 def main(args=None):
     rclpy.init(args=args)
@@ -997,6 +871,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.try_shutdown()
 
-
 if __name__ == "__main__":
     main()
+

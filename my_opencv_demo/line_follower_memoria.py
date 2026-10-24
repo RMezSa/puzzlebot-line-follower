@@ -1,40 +1,27 @@
 #!/usr/bin/env python3
-"""
-LineFollower — ROS 2 Humble
-Jetson Orin Nano · /video_source/compressed (sensor_msgs/CompressedImage)
+"""Nodo ROS 2 ligero para detectar linea y publicar /line_error_px.
 
-Nodo LIGERO: SOLO detección de línea + cálculo de error.
-La detección de señales/semáforo vive en sign_detector.py (proceso aparte),
-para que el modelo YOLO (pesado) no bloquee el seguimiento de línea.
-
-Publica:
-  /line_error_px   (std_msgs/Float32)  — error horizontal en px (NaN si pierde línea)
-
-Debug topics (si debug_view:=true):
-  /debug/line_vis        — frame con overlays de línea
-  /debug/binary_upper    — ROI superior binarizada (lookahead)
-  /debug/binary_lower    — ROI inferior binarizada (ancla)
-
-Cambios incluidos:
-  [FIX 1] roi_top_ratio=0.80 / roi_bottom_ratio=0.90 / lookahead_band_px=5
-          → setpoint más cercano, el robot no se adelanta.
-  [REVERT] Se quitó el escape por centrado; el ancla vuelve a priorizar
-           la posición anterior mediante anchor_memory_weight.
-  [FIX 2] Cuando crossing_active=True el nodo cierra los ojos completamente:
-           no procesa frame ni publica /line_error_px durante la maniobra.
-           Al volver a False, resetea anchor y smoothed_error para re-adquirir limpio.
+Usa memoria de ancla para evitar saltos de carril y se desactiva durante
+maniobras de cruce mediante /crossing_active.
 """
 
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rcl_interfaces.msg import SetParametersResult
 from cv_bridge import CvBridge
 from std_msgs.msg import Float32, Bool
 from sensor_msgs.msg import Image, CompressedImage
-from my_opencv_demo.utils import fresh_qos, pub_img
 
+def fresh_qos(depth=1):
+    """QoS de mínima latencia: best-effort, solo el frame más nuevo."""
+    return QoSProfile(
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=depth,
+    )
 
 class LineFollower(Node):
     def __init__(self):
@@ -44,19 +31,17 @@ class LineFollower(Node):
         self.bridge     = CvBridge()
         self.last_frame = None
 
-        # ── Estado ──────────────────────────────────────────────────────────
         self.smoothed_error_px  = 0.0
         self.lost_count         = 0
         self.last_anchor_x      = None
+        self.last_anchor_area   = None   # [FIX 3] área del blob ancla actual
         self.anchor_lost_count  = 0
         self._crossing_active   = False
-        self._morph_kernel      = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        self._clahe             = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-        # ── Parámetros ───────────────────────────────────────────────────────
         self.declare_parameter('compressed_topic',          '/video_source/compressed')
         self.declare_parameter('error_topic',               '/line_error_px')
 
-        # [FIX 1] ROI con lookahead más cerca del robot
         self.declare_parameter('roi_top_ratio',             0.80)
         self.declare_parameter('roi_bottom_ratio',          0.90)
 
@@ -64,25 +49,25 @@ class LineFollower(Node):
         self.declare_parameter('max_area',                  120000)
         self.declare_parameter('error_alpha',               0.4)
         self.declare_parameter('adaptive_block_size',       51)
-        self.declare_parameter('adaptive_c',                10)
+        self.declare_parameter('adaptive_c',                7)
 
-        self.declare_parameter('anchor_memory_weight',      0.6)
-        self.declare_parameter('anchor_max_jump_px',        80.0)
-        self.declare_parameter('anchor_reset_after',        10)
+        # [FIX 3] valores más conservadores
+        self.declare_parameter('anchor_memory_weight',      0.85)   # era 0.6
+        self.declare_parameter('anchor_max_jump_px',        50.0)   # era 80
+        self.declare_parameter('anchor_reset_after',        20)     # era 10
 
-        # [FIX 1] band más angosta → centroide más abajo
+        # [FIX 3] fracción mínima del área del blob actual para aceptar candidato
+        self.declare_parameter('anchor_min_area_ratio',     0.4)
+
         self.declare_parameter('lookahead_band_px',         5)
-
         self.declare_parameter('debug_view',                False)
 
-        # ── Leer topics ──────────────────────────────────────────────────────
         compressed_topic = self.get_parameter('compressed_topic').get_parameter_value().string_value
         error_topic      = self.get_parameter('error_topic').get_parameter_value().string_value
 
         self._cache_params()
         self.add_on_set_parameters_callback(self._on_params_changed)
 
-        # ── Subscripción a la cámara (depth=1 → siempre el frame más nuevo) ──
         self.sub = self.create_subscription(
             CompressedImage, compressed_topic,
             self.camera_callback, fresh_qos(1)
@@ -91,7 +76,6 @@ class LineFollower(Node):
 
         self.create_subscription(Bool, '/crossing_active', self.cb_crossing, 10)
 
-        # ── Publicadores ─────────────────────────────────────────────────────
         self.error_pub = self.create_publisher(Float32, error_topic, 10)
 
         self.dbg_vis_pub   = self.create_publisher(Image, '/debug/line_vis',     1)
@@ -100,9 +84,6 @@ class LineFollower(Node):
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Caché de parámetros
-    # ─────────────────────────────────────────────────────────────────────────
     def _cache_params(self):
         self.p_roi_top_ratio    = float(self.get_parameter('roi_top_ratio').value)
         self.p_roi_bottom_ratio = float(self.get_parameter('roi_bottom_ratio').value)
@@ -115,18 +96,16 @@ class LineFollower(Node):
         self.p_adaptive_block_size = block if block % 2 == 1 else block + 1
         self.p_adaptive_c          = int(self.get_parameter('adaptive_c').value)
 
-        self.p_anchor_memory_weight = float(self.get_parameter('anchor_memory_weight').value)
-        self.p_anchor_max_jump_px   = float(self.get_parameter('anchor_max_jump_px').value)
-        self.p_anchor_reset_after   = int(self.get_parameter('anchor_reset_after').value)
-        self.p_lookahead_band_px    = int(self.get_parameter('lookahead_band_px').value)
+        self.p_anchor_memory_weight  = float(self.get_parameter('anchor_memory_weight').value)
+        self.p_anchor_max_jump_px    = float(self.get_parameter('anchor_max_jump_px').value)
+        self.p_anchor_reset_after    = int(self.get_parameter('anchor_reset_after').value)
+        self.p_anchor_min_area_ratio = float(self.get_parameter('anchor_min_area_ratio').value)
+        self.p_lookahead_band_px     = int(self.get_parameter('lookahead_band_px').value)
 
-    def _on_params_changed(self, _params):
+    def _on_params_changed(self, params):
         self._cache_params()
         return SetParametersResult(successful=True)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Camera callback
-    # ─────────────────────────────────────────────────────────────────────────
     def camera_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
         frame  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -140,34 +119,41 @@ class LineFollower(Node):
         self._crossing_active = msg.data
 
         if was_active and not msg.data:
-            # [FIX 2] Cruce terminó: resetear toda la memoria para re-adquirir limpio
             self.last_anchor_x     = None
+            self.last_anchor_area  = None
             self.anchor_lost_count = 0
             self.smoothed_error_px = 0.0
             self.lost_count        = 0
             self.get_logger().info('Anchor memory reset tras cruce.')
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Binarizar franja
-    # ─────────────────────────────────────────────────────────────────────────
     def _binarize_strip(self, strip):
         gray   = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+        gray   = self._clahe.apply(gray)                    
+        gray   = cv2.GaussianBlur(gray, (3, 3), 0)          
         binary = cv2.adaptiveThreshold(
             gray, 255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,                 
             cv2.THRESH_BINARY_INV,
             blockSize=self.p_adaptive_block_size,
             C=self.p_adaptive_c,
         )
-        kernel = self._morph_kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         return binary
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Selección de ancla
-    # ─────────────────────────────────────────────────────────────────────────
+    # Selección de ancla  [FIX 3]
     def _select_anchor(self, blobs_lower, center_x):
+        """
+        blobs_lower: lista de (cx, cy, pixel_count)
+
+        Lógica anti lane-switch:
+        1. Con memoria activa, descarta blobs más pequeños que
+           anchor_min_area_ratio * área_actual (artefactos de sobreexposición).
+        2. La función de costo pondera fuertemente la posición anterior.
+        3. Si el mejor candidato salta más de anchor_max_jump_px, congela
+           la posición anterior en lugar de aceptar el salto.
+        """
         if not blobs_lower:
             self.anchor_lost_count += 1
             return None
@@ -177,6 +163,14 @@ class LineFollower(Node):
             and self.anchor_lost_count < self.p_anchor_reset_after
         )
 
+        # Filtrar blobs demasiado pequeños cuando hay memoria
+        candidates = blobs_lower
+        if has_memory and self.last_anchor_area is not None and self.p_anchor_min_area_ratio > 0.0:
+            min_area_threshold = self.last_anchor_area * self.p_anchor_min_area_ratio
+            filtered = [b for b in blobs_lower if b[2] >= min_area_threshold]
+            if filtered:
+                candidates = filtered
+
         if has_memory:
             w = self.p_anchor_memory_weight
             def cost(b):
@@ -185,20 +179,20 @@ class LineFollower(Node):
             def cost(b):
                 return abs(b[0] - center_x)
 
-        best     = min(blobs_lower, key=cost)
+        best     = min(candidates, key=cost)
         anchor_x = best[0]
+        anchor_a = best[2]
 
         if has_memory and abs(anchor_x - self.last_anchor_x) > self.p_anchor_max_jump_px:
+            # Salto demasiado grande → congelar posición anterior
             self.anchor_lost_count += 1
+            return self.last_anchor_x
         else:
             self.anchor_lost_count = 0
+            self.last_anchor_x    = anchor_x
+            self.last_anchor_area = anchor_a
+            return anchor_x
 
-        self.last_anchor_x = anchor_x
-        return anchor_x
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Detección de línea
-    # ─────────────────────────────────────────────────────────────────────────
     def _detect_line(self, frame):
         frame_h, frame_w = frame.shape[:2]
         upper_top_px = int(frame_h * self.p_roi_top_ratio)
@@ -208,7 +202,7 @@ class LineFollower(Node):
         full_roi    = frame[upper_top_px:, :]
         binary_full = self._binarize_strip(full_roi)
 
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             binary_full, connectivity=4
         )
 
@@ -217,16 +211,11 @@ class LineFollower(Node):
             area = stats[i, cv2.CC_STAT_AREA]
             if self.p_min_area <= area <= self.p_max_area:
                 valid_labels.add(i)
-        valid_labels_arr = np.array(list(valid_labels), dtype=np.int32)
 
         lower_offset = lower_top_px - upper_top_px
 
-        if self.p_debug_view:
-            binary_upper = binary_full[:lower_offset, :].copy()
-            binary_lower = binary_full[lower_offset:, :].copy()
-        else:
-            binary_upper = binary_full[:lower_offset, :]
-            binary_lower = binary_full[lower_offset:, :]
+        binary_upper = binary_full[:lower_offset, :].copy()
+        binary_lower = binary_full[lower_offset:, :].copy()
 
         blobs_lower  = []
         labels_lower = labels[lower_offset:, :]
@@ -248,7 +237,7 @@ class LineFollower(Node):
                 anchor_label = label_at_anchor
             else:
                 row        = labels[anchor_row, :]
-                candidates = np.where(np.isin(row, valid_labels_arr))[0]
+                candidates = np.where(np.isin(row, list(valid_labels)))[0]
                 if len(candidates) > 0:
                     nearest      = candidates[np.argmin(np.abs(candidates - anchor_col))]
                     anchor_label = int(row[nearest])
@@ -264,6 +253,8 @@ class LineFollower(Node):
                 cx_upper  = float(xs_up[band_mask].mean())
                 cy_upper  = float(ys_up[band_mask].mean())
                 error_px  = cx_upper - center_x
+            elif cx_lower is not None:
+                error_px = cx_lower - center_x
 
         return (
             error_px,
@@ -274,16 +265,17 @@ class LineFollower(Node):
             upper_top_px, lower_top_px,
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Timer principal
-    # ─────────────────────────────────────────────────────────────────────────
+    def _pub_img(self, publisher, img, encoding='bgr8'):
+        try:
+            msg = self.bridge.cv2_to_imgmsg(img, encoding=encoding)
+            publisher.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f'Error publicando imagen de debug: {e}')
+
     def timer_callback(self):
         if self.last_frame is None:
             return
 
-        # [FIX 2] Ojos cerrados durante maniobra: no procesar ni publicar nada.
-        # El controlador ejecuta open-loop; lo que la cámara ve en el cruce
-        # es incorrecto y contaminaría el anchor y el smoothed_error.
         if self._crossing_active:
             return
 
@@ -306,13 +298,13 @@ class LineFollower(Node):
                 + (1.0 - self.p_error_alpha) * self.smoothed_error_px
             )
             out_msg.data = float(self.smoothed_error_px)
+            self.error_pub.publish(out_msg)
         else:
             self.lost_count += 1
             out_msg.data = float('nan')
+            self.error_pub.publish(out_msg)
             self.get_logger().warn(f'Linea perdida ({self.lost_count}): publicando NaN.')
-        self.error_pub.publish(out_msg)
 
-        # ── Debug ────────────────────────────────────────────────────────────
         if self.p_debug_view:
             frame_h = frame.shape[0]
             vis     = frame.copy()
@@ -324,10 +316,11 @@ class LineFollower(Node):
             if cx_lower is not None:
                 cy_lower_abs = lower_top_px + int((frame_h - lower_top_px) / 2)
                 cv2.circle(vis, (int(cx_lower), cy_lower_abs), 10, (255, 0, 255), -1)
+                area_str = f'{int(self.last_anchor_area)}px²' if self.last_anchor_area else '?'
                 cv2.putText(vis,
-                    f'anchor={cx_lower:.0f} (lost={self.anchor_lost_count})',
+                    f'anchor={cx_lower:.0f} (lost={self.anchor_lost_count}) [{area_str}]',
                     (int(cx_lower) + 12, cy_lower_abs),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 255), 2)
 
             if cx_upper is not None:
                 cy_upper_abs = upper_top_px + int(cy_upper)
@@ -348,10 +341,9 @@ class LineFollower(Node):
                 (frame_w - 160, lower_top_px + 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
-            pub_img(self, self.dbg_vis_pub,   vis,          'bgr8')
-            pub_img(self, self.dbg_upper_pub, binary_upper, 'mono8')
-            pub_img(self, self.dbg_lower_pub, binary_lower, 'mono8')
-
+            self._pub_img(self.dbg_vis_pub,   vis,          'bgr8')
+            self._pub_img(self.dbg_upper_pub, binary_upper, 'mono8')
+            self._pub_img(self.dbg_lower_pub, binary_lower, 'mono8')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -364,6 +356,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.try_shutdown()
 
-
 if __name__ == '__main__':
     main()
+

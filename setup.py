@@ -26,6 +26,9 @@ setup(
         'console_scripts': [
             'sub_image = my_opencv_demo.sub_image:main',
             'line_follower_memoria = my_opencv_demo.line_follower_memoria:main',
+            'line_follower_controller = my_opencv_demo.line_follower_controller:main',
+            'deteccion = my_opencv_demo.deteccion:main',
+            'zebra_detector = my_opencv_demo.zebra_detector:main',
         ],
     },
 )

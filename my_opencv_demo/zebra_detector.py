@@ -1,48 +1,27 @@
 #!/usr/bin/env python3
-"""
-ZebraDetector — ROS 2 Humble
-Jetson Orin Nano · /video_source/compressed (sensor_msgs/CompressedImage)
+"""Nodo ROS 2 para detectar cruces tipo zebra con vision clasica.
 
-Nodo de detección de cruces tipo zebra (cebra) por visión clásica.
-Corre en su propio proceso, independiente del line_follower y sign_detector.
-
-¿Por qué geometría y no solo conteo?
-  Contar "≥3 contornos negros" da falsos positivos (la línea, intersecciones
-  y otros elementos también son negros). Una zebra REAL se distingue por la
-  GEOMETRÍA del conjunto de rayas:
-    - áreas similares (filtro por área relativa, no absoluta fija)
-    - forma alargada (aspect ratio tipo barra)
-    - centroides aproximadamente colineales (poca dispersión perpendicular)
-    - espaciado regular entre rayas (bajo coef. de variación de los gaps)
-  Validando eso se eliminan casi todos los falsos positivos.
-
-Debounce temporal:
-  /zebra_detected solo pasa a True tras `debounce_on` frames consecutivos
-  válidos, y vuelve a False tras `debounce_off` frames sin zebra. Evita
-  el parpadeo del bool.
-
-Publica:
-  /zebra_detected   (std_msgs/Bool)
-  /zebra_stripes    (std_msgs/Int32)   — nº de rayas válidas en el último frame
-
-Debug topics (si debug_view:=true):
-  /debug/zebra_vis      — frame con ROI + contornos candidatos/aceptados
-  /debug/zebra_mask     — máscara binaria de la ROI
-
-NOTA flip:
-  Mismo cv2.flip horizontal que los demás nodos para mantener alineación.
+Filtra rayas candidatas y valida geometria del conjunto para reducir falsos
+positivos antes de publicar /zebra_detected y /zebra_stripes.
 """
 
 import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from rcl_interfaces.msg import SetParametersResult
 from cv_bridge import CvBridge
 from std_msgs.msg import Bool, Int32
 from sensor_msgs.msg import Image, CompressedImage
-from my_opencv_demo.utils import fresh_qos, pub_img
 
+def fresh_qos(depth=1):
+    """QoS de mínima latencia: best-effort, solo el frame más nuevo."""
+    return QoSProfile(
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=depth,
+    )
 
 class ZebraDetector(Node):
     def __init__(self):
@@ -51,47 +30,38 @@ class ZebraDetector(Node):
 
         self.bridge     = CvBridge()
         self.last_frame = None
-        self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-        # ── Estado de debounce ───────────────────────────────────────────────
         self.zebra_state   = False
         self._on_counter   = 0
         self._off_counter  = 0
 
-        # ── Parámetros ───────────────────────────────────────────────────────
         self.declare_parameter('compressed_topic', '/video_source/compressed')
         self.declare_parameter('zebra_topic',      '/zebra_detected')
         self.declare_parameter('stripes_topic',    '/zebra_stripes')
 
-        # ROI vertical
-        self.declare_parameter('roi_top_ratio',    0.65)
-        self.declare_parameter('roi_bottom_ratio', 0.88)
+        self.declare_parameter('roi_top_ratio',    0.70)
+        self.declare_parameter('roi_bottom_ratio', 0.85)
 
-        # ROI horizontal
-        self.declare_parameter('roi_left_ratio',   0.2)   # 0.0 = desde el borde izquierdo
-        self.declare_parameter('roi_right_ratio',  0.8)   # 1.0 = hasta el borde derecho
+        self.declare_parameter('roi_left_ratio',   0.15)   # 0.0 = desde el borde izquierdo
+        self.declare_parameter('roi_right_ratio',  0.85)   # 1.0 = hasta el borde derecho
 
-        # Binarización
         self.declare_parameter('adaptive_block_size', 51)
         self.declare_parameter('adaptive_c',          10)
 
-        # Filtro por raya individual
         self.declare_parameter('min_stripe_area',   150)
         self.declare_parameter('max_stripe_area',  6000)
         self.declare_parameter('min_aspect_ratio',  1.8)
 
         # Validación geométrica del conjunto
-        self.declare_parameter('min_stripes',             4)
+        self.declare_parameter('min_stripes',             3)
         self.declare_parameter('perp_spread_ratio_max',   0.35)
         self.declare_parameter('spacing_cv_max',          0.55)
 
-        # Debounce
         self.declare_parameter('debounce_on',   3)
         self.declare_parameter('debounce_off',  5)
 
         self.declare_parameter('debug_view', False)
 
-        # ── Leer topics ──────────────────────────────────────────────────────
         compressed_topic = self.get_parameter('compressed_topic').get_parameter_value().string_value
         zebra_topic      = self.get_parameter('zebra_topic').get_parameter_value().string_value
         stripes_topic    = self.get_parameter('stripes_topic').get_parameter_value().string_value
@@ -99,7 +69,6 @@ class ZebraDetector(Node):
         self._cache_params()
         self.add_on_set_parameters_callback(self._on_params_changed)
 
-        # ── Subscripción a la cámara ─────────────────────────────────────────
         self.sub = self.create_subscription(
             CompressedImage,
             compressed_topic,
@@ -108,7 +77,6 @@ class ZebraDetector(Node):
         )
         self.get_logger().info(f'Suscrito a {compressed_topic} (JPEG, fresh).')
 
-        # ── Publicadores ─────────────────────────────────────────────────────
         self.zebra_pub    = self.create_publisher(Bool,  zebra_topic,   10)
         self.stripes_pub  = self.create_publisher(Int32, stripes_topic, 10)
         self.dbg_vis_pub  = self.create_publisher(Image, '/debug/zebra_vis',  1)
@@ -116,9 +84,6 @@ class ZebraDetector(Node):
 
         self.timer = self.create_timer(0.05, self.timer_callback)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Caché de parámetros
-    # ─────────────────────────────────────────────────────────────────────────
     def _cache_params(self):
         self.p_roi_top_ratio    = float(self.get_parameter('roi_top_ratio').value)
         self.p_roi_bottom_ratio = float(self.get_parameter('roi_bottom_ratio').value)
@@ -143,13 +108,10 @@ class ZebraDetector(Node):
 
         self.p_debug_view = bool(self.get_parameter('debug_view').value)
 
-    def _on_params_changed(self, _params):
+    def _on_params_changed(self, params):
         self._cache_params()
         return SetParametersResult(successful=True)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Camera callback
-    # ─────────────────────────────────────────────────────────────────────────
     def camera_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
         frame  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -158,9 +120,6 @@ class ZebraDetector(Node):
             return
         self.last_frame = frame
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Binarizar ROI
-    # ─────────────────────────────────────────────────────────────────────────
     def _binarize(self, roi):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
@@ -173,14 +132,12 @@ class ZebraDetector(Node):
             C=self.p_adaptive_c,
         )
 
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  self._morph_kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self._morph_kernel)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
         return binary
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Extraer rayas candidatas
-    # ─────────────────────────────────────────────────────────────────────────
     def _find_stripe_candidates(self, binary):
         """
         Devuelve lista de candidatos:
@@ -224,9 +181,7 @@ class ZebraDetector(Node):
 
         return candidates
 
-    # ─────────────────────────────────────────────────────────────────────────
     # Validación geométrica del conjunto
-    # ─────────────────────────────────────────────────────────────────────────
     def _validate_zebra(self, candidates):
         """
         Decide si el conjunto de candidatos forma una zebra real.
@@ -300,9 +255,6 @@ class ZebraDetector(Node):
         info['reason'] = 'OK'
         return True, info
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Debounce
-    # ─────────────────────────────────────────────────────────────────────────
     def _update_debounce(self, raw_detected):
         if raw_detected:
             self._on_counter += 1
@@ -319,9 +271,13 @@ class ZebraDetector(Node):
 
         return self.zebra_state
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Timer principal
-    # ─────────────────────────────────────────────────────────────────────────
+    def _pub_img(self, publisher, img, encoding='bgr8'):
+        try:
+            msg = self.bridge.cv2_to_imgmsg(img, encoding=encoding)
+            publisher.publish(msg)
+        except Exception as e:
+            self.get_logger().warn(f'Error publicando imagen de debug: {e}')
+
     def timer_callback(self):
         if self.last_frame is None:
             return
@@ -348,21 +304,17 @@ class ZebraDetector(Node):
         raw_zebra, info = self._validate_zebra(candidates)
         stable_zebra = self._update_debounce(raw_zebra)
 
-        # Publicar detección
         zebra_msg = Bool()
         zebra_msg.data = bool(stable_zebra)
         self.zebra_pub.publish(zebra_msg)
 
-        # Publicar número de rayas
         stripes_msg = Int32()
         stripes_msg.data = int(info['n'])
         self.stripes_pub.publish(stripes_msg)
 
-        # ── Debug ────────────────────────────────────────────────────────────
         if self.p_debug_view:
             vis = frame.copy()
 
-            # ROI box
             cv2.rectangle(
                 vis,
                 (left_px, top_px),
@@ -381,13 +333,11 @@ class ZebraDetector(Node):
                 2,
             )
 
-            # Verde si la zebra fue aceptada, gris si no
             cnt_color = (0, 255, 0) if raw_zebra else (160, 160, 160)
 
             for c in candidates:
                 x, y, w, h = c['bbox']
 
-                # Offset vertical y horizontal por el recorte de la ROI
                 cv2.rectangle(
                     vis,
                     (x + left_px, y + top_px),
@@ -405,7 +355,6 @@ class ZebraDetector(Node):
                     -1,
                 )
 
-            # Texto de estado
             estado = 'ZEBRA: YES' if stable_zebra else 'ZEBRA: no'
             estado_color = (0, 255, 0) if stable_zebra else (0, 0, 255)
 
@@ -451,9 +400,8 @@ class ZebraDetector(Node):
                 1,
             )
 
-            pub_img(self, self.dbg_vis_pub,  vis,    'bgr8')
-            pub_img(self, self.dbg_mask_pub, binary, 'mono8')
-
+            self._pub_img(self.dbg_vis_pub,  vis,    'bgr8')
+            self._pub_img(self.dbg_mask_pub, binary, 'mono8')
 
 def main(args=None):
     rclpy.init(args=args)
@@ -468,6 +416,6 @@ def main(args=None):
         node.destroy_node()
         rclpy.try_shutdown()
 
-
 if __name__ == '__main__':
     main()
+
