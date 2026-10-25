@@ -2,7 +2,7 @@
 
 ROS 2 package that drives a Puzzlebot (Jetson based differential drive robot) around a small road circuit: it follows the lane, obeys traffic lights and signs, and crosses intersections at zebra crossings. Line following is handled by a Mamdani fuzzy controller inside a 7 state finite state machine.
 
-Team project for the Robotics Implementation course at Tecnológico de Monterrey (2026), by Roberd Meza and Emiliano Moreno Gómez.
+Team project for the Robotics Implementation course at Tecnológico de Monterrey (2026), by Roberd Meza Sainz and Emiliano Moreno Gómez.
 
 ## Architecture
 
